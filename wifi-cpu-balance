@@ -329,6 +329,8 @@ apply_all() {
   command -v nproc >/dev/null 2>&1 || die "nproc is required"
   load_reserved
 
+  [[ -n "$INTERFACES" ]] || die "INTERFACES is empty; set physical dataplane NICs explicitly in $CONFIG_FILE before apply"
+
   if systemctl is-active --quiet irqbalance 2>/dev/null; then
     warn "irqbalance is active and may overwrite explicit IRQ affinity; disable it for deterministic pinning"
   fi
@@ -342,7 +344,7 @@ apply_all() {
     ((${#cpus[@]} > 0)) || { warn "$iface: no eligible CPUs after RESERVED_CPUS=$RESERVED_CPUS"; continue; }
 
     maybe_resize_channels "$iface" "${#cpus[@]}"
-    mapfile -t rxqs < <(queue_paths "$iface" rx)
+    mapfile -t rxqs < <(queueue_paths "$iface" rx)
     rebalance_rss "$iface" "${#rxqs[@]}"
     pin_irqs "$iface" "$((idx * 7))" "${cpus[@]}"
     tune_rps_xps "$iface" "${cpus[@]}"

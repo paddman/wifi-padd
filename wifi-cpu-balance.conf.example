@@ -1,4 +1,4 @@
-# Space-separated physical NICs. Empty = auto-detect UP physical NICs.
+# Space-separated physical dataplane NICs. Empty is safe for plan/status, but apply will refuse to run.
 # Example for a 2x25G gateway:
 # INTERFACES="ens3f0np0 ens3f1np1"
 INTERFACES=""
