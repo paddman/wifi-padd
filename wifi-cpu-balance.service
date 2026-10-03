@@ -1,0 +1,13 @@
+[Unit]
+Description=WiFi Hotspot NUMA-aware CPU and NIC queue balancer
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wifi-cpu-balance apply
+ExecReload=/usr/local/sbin/wifi-cpu-balance apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
