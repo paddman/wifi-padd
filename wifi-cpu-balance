@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG_FILE="${CONFIG_FILE:-/etc/wifi-cpu-balance.conf}"
+[[ -r "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+INTERFACES="${INTERFACES:-}"
+RESERVED_CPUS="${RESERVED_CPUS:-0-3}"
+USE_NUMA_LOCAL="${USE_NUMA_LOCAL:-1}"
+MANAGE_CHANNELS="${MANAGE_CHANNELS:-0}"
+MAX_QUEUES_PER_NIC="${MAX_QUEUES_PER_NIC:-32}"
+REBALANCE_RSS="${REBALANCE_RSS:-1}"
+RPS_MODE="${RPS_MODE:-auto}"               # auto|on|off
+ENABLE_XPS="${ENABLE_XPS:-1}"
+ENABLE_RFS="${ENABLE_RFS:-1}"
+RFS_SOCK_ENTRIES="${RFS_SOCK_ENTRIES:-1048576}"
+CONNTRACK_MAX="${CONNTRACK_MAX:-auto}"
+NETDEV_MAX_BACKLOG="${NETDEV_MAX_BACKLOG:-250000}"
+NETDEV_BUDGET="${NETDEV_BUDGET:-600}"
+NETDEV_BUDGET_USECS="${NETDEV_BUDGET_USECS:-8000}"
+
+log()  { printf '[wifi-cpu-balance] %s\n' "$*"; }
+warn() { printf '[wifi-cpu-balance] WARNING: %s\n' "$*" >&2; }
+die()  { printf '[wifi-cpu-balance] ERROR: %s\n' "$*" >&2; exit 1; }
+
+need_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "run as root"
+}
+
+expand_cpulist() {
+  local item start end n
+  local list="${1// /}"
+  [[ -n "$list" ]] || return 0
+  IFS=',' read -ra _parts <<< "$list"
+  for item in "${_parts[@]}"; do
+    if [[ "$item" == *-* ]]; then
+      start="${item%-*}"
+      end="${item#*-}"
+      for ((n=start; n<=end; n++)); do printf '%s\n' "$n"; done
+    elif [[ "$item" =~ ^[0-9]+$ ]]; then
+      printf '%s\n' "$item"
+    fi
+  done
+}
+
+compress_cpulist() {
+  local -a a=("$@")
+  (IFS=,; echo "${a[*]}")
+}
+
+all_online_cpus() {
+  expand_cpulist "$(cat /sys/devices/system/cpu/online)"
+}
+
+declare -A RESERVED=()
+load_reserved() {
+  local c
+  RESERVED=()
+  while read -r c; do
+    [[ -n "$c" ]] && RESERVED["$c"]=1
+  done < <(expand_cpulist "$RESERVED_CPUS")
+}
+
+iface_numa_node() {
+  local iface="$1"
+  local p="/sys/class/net/$iface/device/numa_node"
+  if [[ -r "$p" ]]; then cat "$p"; else echo -1; fi
+}
+
+eligible_cpus_for_iface() {
+  local iface="$1" node c source_list
+  node="$(iface_numa_node "$iface")"
+  if [[ "$USE_NUMA_LOCAL" == "1" && "$node" =~ ^[0-9]+$ && -r "/sys/devices/system/node/node${node}/cpulist" ]]; then
+    source_list="$(cat "/sys/devices/system/node/node${node}/cpulist")"
+  else
+    source_list="$(cat /sys/devices/system/cpu/online)"
+  fi
+
+  while read -r c; do
+    [[ -n "$c" ]] || continue
+    [[ -n "${RESERVED[$c]:-}" ]] && continue
+    printf '%s\n' "$c"
+  done < <(expand_cpulist "$source_list")
+}
+
+cpu_list_to_mask() {
+  local maxcpu cpu group bit i
+  local -a cpus=("$@")
+  ((${#cpus[@]} > 0)) || { echo 0; return; }
+  maxcpu="$(< /sys/devices/system/cpu/possible)"
+  maxcpu="${maxcpu##*-}"
+  [[ "$maxcpu" =~ ^[0-9]+$ ]] || maxcpu=$(( $(nproc) - 1 ))
+  local groups=$((maxcpu / 32 + 1))
+  local -a words=()
+  for ((i=0; i<groups; i++)); do words[i]=0; done
+  for cpu in "${cpus[@]}"; do
+    [[ "$cpu" =~ ^[0-9]+$ ]] || continue
+    group=$((cpu / 32))
+    bit=$((cpu % 32))
+    words[group]=$(( words[group] | (1 << bit) ))
+  done
+  local out="" part
+  for ((i=groups-1; i>=0; i--)); do
+    printf -v part '%08x' "${words[i]}"
+    if [[ -n "$out" ]]; then out+=",${part}"; else out="$part"; fi
+  done
+  # Kernel accepts leading zero groups, but trim them to keep status readable.
+  while [[ "$out" == 00000000,* ]]; do out="${out#00000000,}"; done
+  echo "$out"
+}
+
+discover_interfaces() {
+  local n
+  if [[ -n "$INTERFACES" ]]; then
+    for n in $INTERFACES; do
+      [[ -d "/sys/class/net/$n" ]] && echo "$n" || warn "interface $n does not exist"
+    done
+    return
+  fi
+
+  for p in /sys/class/net/*; do
+    n="${p##*/}"
+    [[ "$n" == "lo" ]] && continue
+    [[ -e "$p/device" ]] || continue
+    [[ "$(cat "$p/operstate" 2>/dev/null || true)" == "up" ]] || continue
+    echo "$n"
+  done
+}
+
+queue_paths() {
+  local iface="$1" dir="$2"
+  find "/sys/class/net/$iface/queues" -maxdepth 1 -type d -name "${dir}-*" -printf '%f\n' 2>/dev/null | sort -V
+}
+
+nic_irqs() {
+  local iface="$1" d irq
+  d="/sys/class/net/$iface/device/msi_irqs"
+  if [[ -d "$d" ]]; then
+    for irq in "$d"/*; do
+      [[ -e "$irq" ]] && basename "$irq"
+    done | sort -n
+    return
+  fi
+  awk -v iface="$iface" '
+    index($0, iface) {
+      irq=$1; gsub(":", "", irq)
+      if (irq ~ /^[0-9]+$/) print irq
+    }
+  ' /proc/interrupts | sort -n -u
+}
+
+partition_cpus() {
+  local qidx="$1" qcount="$2"; shift 2
+  local -a cpus=("$@") out=()
+  local i
+  for ((i=0; i<${#cpus[@]}; i++)); do
+    (( i % qcount == qidx )) && out+=("${cpus[i]}")
+  done
+  if ((${#out[@]} == 0)); then
+    out+=("${cpus[qidx % ${#cpus[@]}]}")
+  fi
+  printf '%s\n' "${out[@]}"
+}
+
+maybe_resize_channels() {
+  local iface="$1" cpu_count="$2" max desired
+  [[ "$MANAGE_CHANNELS" == "1" ]] || return 0
+  command -v ethtool >/dev/null 2>&1 || { warn "ethtool missing; cannot resize $iface queues"; return 0; }
+
+  max="$(ethtool -l "$iface" 2>/dev/null | awk '
+    /Pre-set maximums:/ {p=1; next}
+    /Current hardware settings:/ {p=0}
+    p && $1=="Combined:" {print $2; exit}
+  ')"
+  [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || { warn "$iface does not expose combined channel control"; return 0; }
+
+  desired="$cpu_count"
+  (( desired > MAX_QUEUES_PER_NIC )) && desired="$MAX_QUEUES_PER_NIC"
+  (( desired > max )) && desired="$max"
+  (( desired < 1 )) && desired=1
+
+  log "$iface: setting combined queues to $desired (driver max $max)"
+  ethtool -L "$iface" combined "$desired" || warn "$iface refused channel resize"
+}
+
+rebalance_rss() {
+  local iface="$1" rx_count="$2"
+  [[ "$REBALANCE_RSS" == "1" ]] || return 0
+  (( rx_count > 1 )) || return 0
+  command -v ethtool >/dev/null 2>&1 || return 0
+  ethtool -X "$iface" equal "$rx_count" >/dev/null 2>&1 || true
+}
+
+pin_irqs() {
+  local iface="$1" offset="$2"; shift 2
+  local -a cpus=("$@") irqs=()
+  mapfile -t irqs < <(nic_irqs "$iface")
+  ((${#irqs[@]} > 0)) || { warn "$iface: no MSI/MSI-X IRQs found"; return 0; }
+
+  local i irq cpu target
+  for ((i=0; i<${#irqs[@]}; i++)); do
+    irq="${irqs[i]}"
+    cpu="${cpus[(i + offset) % ${#cpus[@]}]}"
+    target="/proc/irq/$irq/smp_affinity_list"
+    [[ -w "$target" ]] || continue
+    echo "$cpu" > "$target" || warn "$iface: could not pin IRQ $irq to CPU $cpu"
+  done
+  log "$iface: pinned ${#irqs[@]} IRQs across ${#cpus[@]} eligible CPUs"
+}
+
+tune_rps_xps() {
+  local iface="$1"; shift
+  local -a cpus=("$@") rxqs=() txqs=()
+  mapfile -t rxqs < <(queue_paths "$iface" rx)
+  mapfile -t txqs < <(queue_paths "$iface" tx)
+
+  local rx_count="${#rxqs[@]}" tx_count="${#txqs[@]}"
+  local rps_enabled=0
+  case "$RPS_MODE" in
+    on)  rps_enabled=1 ;;
+    off) rps_enabled=0 ;;
+    auto)
+      # Hardware RSS already has at least one RX queue per selected CPU:
+      # keep RPS off to avoid cross-CPU cache churn.
+      (( rx_count < ${#cpus[@]} )) && rps_enabled=1 || rps_enabled=0
+      ;;
+    *) die "RPS_MODE must be auto, on or off" ;;
+  esac
+
+  local i q mask flow_each
+  if (( rx_count > 0 )); then
+    flow_each=$((RFS_SOCK_ENTRIES / rx_count))
+    (( flow_each < 4096 )) && flow_each=4096
+
+    for ((i=0; i<rx_count; i++)); do
+      q="${rxqs[i]}"
+      if (( rps_enabled )); then
+        mapfile -t part < <(partition_cpus "$i" "$rx_count" "${cpus[@]}")
+        mask="$(cpu_list_to_mask "${part[@]}")"
+        [[ -w "/sys/class/net/$iface/queues/$q/rps_cpus" ]] && echo "$mask" > "/sys/class/net/$iface/queues/$q/rps_cpus"
+        if [[ "$ENABLE_RFS" == "1" && -w "/sys/class/net/$iface/queues/$q/rps_flow_cnt" ]]; then
+          echo "$flow_each" > "/sys/class/net/$iface/queues/$q/rps_flow_cnt"
+        fi
+      else
+        [[ -w "/sys/class/net/$iface/queues/$q/rps_cpus" ]] && echo 0 > "/sys/class/net/$iface/queues/$q/rps_cpus"
+      fi
+    done
+  fi
+
+  if [[ "$ENABLE_XPS" == "1" && "$tx_count" -gt 0 ]]; then
+    for ((i=0; i<tx_count; i++)); do
+      q="${txqs[i]}"
+      mapfile -t part < <(partition_cpus "$i" "$tx_count" "${cpus[@]}")
+      mask="$(cpu_list_to_mask "${part[@]}")"
+      [[ -w "/sys/class/net/$iface/queues/$q/xps_cpus" ]] && echo "$mask" > "/sys/class/net/$iface/queues/$q/xps_cpus"
+    done
+  fi
+
+  log "$iface: RX queues=$rx_count TX queues=$tx_count RPS=$rps_enabled XPS=$ENABLE_XPS"
+}
+
+sysctl_if_exists() {
+  local key="$1" value="$2"
+  if sysctl -N "$key" >/dev/null 2>&1; then
+    sysctl -q -w "$key=$value"
+  fi
+}
+
+auto_conntrack_max() {
+  local mem_kb by_mem by_cpu out
+  mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
+  by_mem=$((mem_kb / 64))
+  by_cpu=$(( $(nproc) * 32768 ))
+  out="$by_mem"
+  (( out < by_cpu )) && out="$by_cpu"
+  (( out < 262144 )) && out=262144
+  (( out > 8388608 )) && out=8388608
+  echo "$out"
+}
+
+tune_kernel() {
+  local ct="$CONNTRACK_MAX"
+  [[ "$ct" == "auto" ]] && ct="$(auto_conntrack_max)"
+  [[ "$ct" =~ ^[0-9]+$ ]] || die "CONNTRACK_MAX must be an integer or auto"
+
+  sysctl_if_exists net.core.netdev_max_backlog "$NETDEV_MAX_BACKLOG"
+  sysctl_if_exists net.core.netdev_budget "$NETDEV_BUDGET"
+  sysctl_if_exists net.core.netdev_budget_usecs "$NETDEV_BUDGET_USECS"
+  sysctl_if_exists net.core.rps_sock_flow_entries "$RFS_SOCK_ENTRIES"
+  sysctl_if_exists net.netfilter.nf_conntrack_max "$ct"
+
+  if [[ -w /sys/module/nf_conntrack/parameters/hashsize ]]; then
+    local hash=$((ct / 4))
+    (( hash < 65536 )) && hash=65536
+    echo "$hash" > /sys/module/nf_conntrack/parameters/hashsize || true
+  fi
+  log "kernel: conntrack_max=$ct backlog=$NETDEV_MAX_BACKLOG budget=$NETDEV_BUDGET/$NETDEV_BUDGET_USECS"
+}
+
+show_status() {
+  load_reserved
+  printf 'CPUs online : %s\n' "$(cat /sys/devices/system/cpu/online)"
+  printf 'Reserved    : %s\n' "$RESERVED_CPUS"
+  printf 'irqbalance  : %s\n' "$(systemctl is-active irqbalance 2>/dev/null || true)"
+  printf '\n'
+  local iface node rx tx irqs
+  while read -r iface; do
+    [[ -n "$iface" ]] || continue
+    node="$(iface_numa_node "$iface")"
+    rx="$(queue_paths "$iface" rx | wc -l)"
+    tx="$(queue_paths "$iface" tx | wc -l)"
+    irqs="$(nic_irqs "$iface" | wc -l)"
+    printf '%-16s NUMA=%-3s RXQ=%-3s TXQ=%-3s IRQ=%-3s eligible=' "$iface" "$node" "$rx" "$tx" "$irqs"
+    mapfile -t cpus < <(eligible_cpus_for_iface "$iface")
+    compress_cpulist "${cpus[@]}"
+  done < <(discover_interfaces)
+
+  printf '\nTop network-related IRQ lines:\n'
+  grep -E 'TxRx|mlx|ixgbe|i40e|ice|ena|virtio' /proc/interrupts 2>/dev/null | head -n 40 || true
+
+  printf '\nNET_RX softirq counters:\n'
+  grep 'NET_RX' /proc/softirqs || true
+  printf '\nNET_TX softirq counters:\n'
+  grep 'NET_TX' /proc/softirqs || true
+}
+
+apply_all() {
+  need_root
+  command -v nproc >/dev/null 2>&1 || die "nproc is required"
+  load_reserved
+
+  [[ -n "$INTERFACES" ]] || die "INTERFACES is empty; set physical dataplane NICs explicitly in $CONFIG_FILE before apply"
+
+  if systemctl is-active --quiet irqbalance 2>/dev/null; then
+    warn "irqbalance is active and may overwrite explicit IRQ affinity; disable it for deterministic pinning"
+  fi
+
+  tune_kernel
+
+  local iface idx=0
+  while read -r iface; do
+    [[ -n "$iface" ]] || continue
+    mapfile -t cpus < <(eligible_cpus_for_iface "$iface")
+    ((${#cpus[@]} > 0)) || { warn "$iface: no eligible CPUs after RESERVED_CPUS=$RESERVED_CPUS"; continue; }
+
+    maybe_resize_channels "$iface" "${#cpus[@]}"
+    mapfile -t rxqs < <(queueue_paths "$iface" rx)
+    rebalance_rss "$iface" "${#rxqs[@]}"
+    pin_irqs "$iface" "$((idx * 7))" "${cpus[@]}"
+    tune_rps_xps "$iface" "${cpus[@]}"
+    idx=$((idx + 1))
+  done < <(discover_interfaces)
+
+  log "apply complete"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  wifi-cpu-balance apply     Apply NUMA-aware CPU/IRQ/RPS/XPS tuning
+  wifi-cpu-balance status    Show queue, IRQ and softirq distribution
+  wifi-cpu-balance plan      Show detected NICs and CPUs without changing anything
+
+Config: /etc/wifi-cpu-balance.conf (override with CONFIG_FILE=/path/file)
+EOF
+}
+
+plan() {
+  load_reserved
+  local iface
+  while read -r iface; do
+    [[ -n "$iface" ]] || continue
+    mapfile -t cpus < <(eligible_cpus_for_iface "$iface")
+    printf '%s: NUMA=%s CPUs=%s RXQ=%s TXQ=%s IRQ=%s\n' \
+      "$iface" "$(iface_numa_node "$iface")" "$(compress_cpulist "${cpus[@]}")" \
+      "$(queue_paths "$iface" rx | wc -l)" "$(queue_paths "$iface" tx | wc -l)" "$(nic_irqs "$iface" | wc -l)"
+  done < <(discover_interfaces)
+}
+
+case "${1:-}" in
+  apply)  apply_all ;;
+  status) show_status ;;
+  plan)   plan ;;
+  *) usage; exit 2 ;;
+esac

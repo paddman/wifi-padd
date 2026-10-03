@@ -1,0 +1,33 @@
+# Space-separated physical dataplane NICs. Empty is safe for plan/status, but apply will refuse to run.
+# Example for a 2x25G gateway:
+# INTERFACES="ens3f0np0 ens3f1np1"
+INTERFACES=""
+
+# Keep housekeeping/control-plane CPUs out of NIC IRQ/RPS/XPS work.
+RESERVED_CPUS="0-3"
+
+# Prefer CPUs local to each NIC's PCI NUMA node.
+USE_NUMA_LOCAL=1
+
+# Changing NIC channel count can briefly disrupt live traffic.
+# Leave off until validated during a maintenance window.
+MANAGE_CHANNELS=0
+MAX_QUEUES_PER_NIC=32
+
+# Rebuild the NIC RSS indirection table evenly across existing RX queues.
+REBALANCE_RSS=1
+
+# auto: enable RPS only when RX queues < eligible CPUs.
+# on: force RPS. off: rely on hardware RSS only.
+RPS_MODE="auto"
+
+ENABLE_XPS=1
+ENABLE_RFS=1
+RFS_SOCK_ENTRIES=1048576
+
+# auto scales with RAM and CPU, capped at 8,388,608 entries.
+CONNTRACK_MAX="auto"
+
+NETDEV_MAX_BACKLOG=250000
+NETDEV_BUDGET=600
+NETDEV_BUDGET_USECS=8000
